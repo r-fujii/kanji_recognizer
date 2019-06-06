@@ -19,6 +19,17 @@ extension UIColor {
     }
 }
 
+extension UIImage {
+    func resizeImage(width: CGFloat, height: CGFloat) -> UIImage {
+        UIGraphicsBeginImageContext(CGSize(width: width, height: height))
+        self.draw(in: CGRect(x: 0, y: 0, width: width, height: height))
+        let resizedImage: UIImage! = UIGraphicsGetImageFromCurrentImageContext()
+        UIGraphicsEndImageContext()
+        
+        return resizedImage
+    }
+}
+
 enum ButtonMode {
     case Undo, Clear
     var displayedLabel: String {
@@ -56,15 +67,22 @@ class CharReader: UIViewController {
     var clearButtonMode: ButtonMode = .Clear
     var lastTimeDrawn = CFAbsoluteTime()
     
+    var clipX: (minX: CGFloat, maxX: CGFloat) = (CGFloat.greatestFiniteMagnitude, 0.0)
+    var clipY: (minY: CGFloat, maxY: CGFloat) = (CGFloat.greatestFiniteMagnitude, 0.0)
+    
+    let nbest = 6
+    
     // settings for cloud vision API
-    let googleAPIKey = KeyManager().getValue(key: "googleAPI") as! String
-    var googleURL: URL {
-        return URL(string: "https://vision.googleapis.com/v1/images:annotate?key=\(googleAPIKey)")!
-    }
+    // let googleAPIKey = KeyManager().getValue(key: "googleAPI") as! String
+    // var googleURL: URL {
+    //      return URL(string: "https://vision.googleapis.com/v1/images:annotate?key=\(googleAPIKey)")!
+    //}
     
     @IBAction func drawKanji(_ sender: UIPanGestureRecognizer) {
         let loc = sender.location(in: sender.view)
         lastTimeDrawn = CFAbsoluteTimeGetCurrent()
+        clipX = (min(clipX.minX, max(loc.x, 0)), max(clipX.maxX, min(loc.x, sender.view!.frame.maxX)))
+        clipY = (min(clipY.minY, max(loc.y, 0)), max(clipY.maxY, min(loc.y, sender.view!.frame.maxY)))
         
         if sender.state == .began {
             drawPath = UIBezierPath()
@@ -73,7 +91,7 @@ class CharReader: UIViewController {
             shapeLayer = CAShapeLayer()
             shapeLayer.strokeColor = UIColor.black.cgColor
             shapeLayer.fillColor = UIColor.clear.cgColor
-            shapeLayer.lineWidth = 2.0
+            shapeLayer.lineWidth = 4.0
             sender.view?.layer.addSublayer(shapeLayer)
             self.addedLayers.append(shapeLayer)
         } else if sender.state == .changed {
@@ -100,6 +118,9 @@ class CharReader: UIViewController {
             resultLabel.isHidden = true
             for button in resultButtons {
                 button.isHidden = true
+            // initialize clipping area again
+            clipX = (CGFloat.greatestFiniteMagnitude, 0.0)
+            clipY = (CGFloat.greatestFiniteMagnitude, 0.0)
             }
         } else {
             // To avoid turning back to clear button while pushing undo in a row
@@ -141,7 +162,15 @@ class CharReader: UIViewController {
         canvas.layer.addSublayer(gridLayer)
     }
     
+    func clipImage(_ image: UIImage, clipArea: CGRect) -> UIImage {
+        let clippedImage = UIImage(cgImage: (image.cgImage!.cropping(to: clipArea))!, scale: image.scale, orientation: image.imageOrientation)
+        return clippedImage
+    }
+    
     func getImage(_ view : UIView) -> UIImage {
+        
+        let clipWidth = max(clipX.maxX - clipX.minX, clipY.maxY - clipY.minY)
+        let origin = CGPoint(x: max(clipX.maxX - (clipWidth + 40.0), 0), y: max(clipY.maxY - (clipWidth + 40.0), 0))
         
         let rect = view.bounds
         UIGraphicsBeginImageContext(rect.size)
@@ -156,35 +185,23 @@ class CharReader: UIViewController {
         
         UIGraphicsEndImageContext()
         
-        return image!
+        // what if clipped area goes outside the canvas?
+        let clippedImage = clipImage(image!, clipArea: CGRect(origin: origin, size: CGSize(width: clipWidth + 2 * 40.0, height: clipWidth + 2 * 40.0)))
+        return clippedImage.resizeImage(width: 28.0, height: 28.0)
     }
     
     func detectCharFromImage(_ image: UIImage) {
         // 画像をbase64encode
         if let base64EncodedImage: String = image.pngData()?.base64EncodedString() {
-            // query
-            // 文字検出のためのtype -> TEXT_DETECTION
-            let request: Parameters = [
-                "requests": [
-                    "image": [
-                        "content": base64EncodedImage
-                    ],
-                    "features": [
-                        [
-                            "type": "DOCUMENT_TEXT_DETECTION",
-                            "maxResults": 6
-                        ]
-                    ]
-                ]
-            ]
-     
-            let httpHeader: HTTPHeaders = [
-                "Content-Type": "application/json",
-                "X-Ios-Bundle-Identifier": Bundle.main.bundleIdentifier!
-            ]
-        Alamofire.request("https://vision.googleapis.com/v1/images:annotate?key=\(googleAPIKey)", method: .post, parameters: request, encoding: JSONEncoding.default, headers: httpHeader).validate(statusCode: 200..<300).responseJSON { response in
-            // 受け取ったレスポンスの後処理
-            self.showResult(response: response)
+            let request: Parameters = ["data": base64EncodedImage]
+            
+            Alamofire.request("http://localhost:2036/post", method: .post, parameters: request).responseJSON {response in
+                switch response.result {
+                case .success:
+                    self.showResult(response: response)
+                case .failure:
+                    return
+                }
             }
         }
     }
@@ -194,56 +211,104 @@ class CharReader: UIViewController {
             return
         }
         let json = JSON(result)
-        let annotations: JSON = json["responses"][0]["textAnnotations"]
-        let numAnnos = annotations.count
-        
-        if numAnnos > 0 {
-            resultLabel.isHidden = false
-        }
-        
-        for i in 0 ..< resultButtons.count {
-            if i < numAnnos {
-            //結果からdescriptionを取り出して一つの文字列にする
-                var detectedText: String = ""
-                detectedText = annotations[i]["description"].string!
-                // 結果を表示
-                resultButtons[i].setTitle(detectedText, for: .normal)
-
-                UIView.transition(with: self.view, duration: 0.5, options: UIView.AnimationOptions(), animations: {
-                    self.resultButtons[i].isHidden = false
-                }, completion: nil)
-            } else {
-                resultButtons[i].isHidden = true
+        for entry in json {
+            let rank = Int(entry.0)!
+            let cls = entry.1["cls"].string!
+            if rank < nbest {
+                resultButtons[rank].setTitle(cls, for: .normal)
+                UIView.transition(with: self.view, duration: 0.5, options: UIView.AnimationOptions(), animations: { self.resultButtons[rank].isHidden = false }, completion: nil)
             }
         }
     }
+
+// uncomment when using API
+//    func detectCharFromImageAPI(_ image: UIImage) {
+//        // 画像をbase64encode
+//        if let base64EncodedImage: String = image.pngData()?.base64EncodedString() {
+//            // query
+//            // 文字検出のためのtype -> TEXT_DETECTION
+//            let request: Parameters = [
+//                "requests": [
+//                    "image": [
+//                        "content": base64EncodedImage
+//                    ],
+//                    "features": [
+//                        [
+//                            "type": "DOCUMENT_TEXT_DETECTION",
+//                            "maxResults": 6
+//                        ]
+//                    ]
+//                ]
+//            ]
+//
+//            let httpHeader: HTTPHeaders = [
+//                "Content-Type": "application/json",
+//                "X-Ios-Bundle-Identifier": Bundle.main.bundleIdentifier!
+//            ]
+//        Alamofire.request("https://vision.googleapis.com/v1/images:annotate?key=\(googleAPIKey)", method: .post, parameters: request, encoding: JSONEncoding.default, headers: httpHeader).validate(statusCode: 200..<300).responseJSON { response in
+//            // 受け取ったレスポンスの後処理
+//            self.showResultAPI(response: response)
+//            }
+//        }
+//    }
+    
+//    func showResultAPI(response: DataResponse<Any>) {
+//        guard let result = response.result.value else {
+//            return
+//        }
+//        let json = JSON(result)
+//        let annotations: JSON = json["responses"][0]["textAnnotations"]
+//        let numAnnos = annotations.count
+//
+//        if numAnnos > 0 {
+//            resultLabel.isHidden = false
+//        }
+//
+//        for i in 0 ..< resultButtons.count {
+//            if i < numAnnos {
+//            //結果からdescriptionを取り出して一つの文字列にする
+//                var detectedText: String = ""
+//                detectedText = annotations[i]["description"].string!
+//                // 結果を表示
+//                resultButtons[i].setTitle(detectedText, for: .normal)
+//
+//                UIView.transition(with: self.view, duration: 0.5, options: UIView.AnimationOptions(), animations: {
+//                    self.resultButtons[i].isHidden = false
+//                }, completion: nil)
+//            } else {
+//                resultButtons[i].isHidden = true
+//            }
+//        }
+//    }
     
     @IBAction func sendImage(_ sender: UIButton) {
         gridLayer.isHidden = true
         let image : UIImage = getImage(self.kanjiCanvas)
+        // uncomment if using API
+        // self.detectCharFromImageAPI(image)
         self.detectCharFromImage(image)
         gridLayer.isHidden = !gridSwitch.isOn
         
         // カメラロールに保存する
-        //        UIImageWriteToSavedPhotosAlbum(image, self, #selector(self.didFinishSavingImage(_:didFinishSavingWithError:contextInfo:)), nil)
+        // UIImageWriteToSavedPhotosAlbum(image, self, #selector(self.didFinishSavingImage(_:didFinishSavingWithError:contextInfo:)), nil)
     }
     
-    // カメラロールへの保存の結果を返す
-    //    @objc func didFinishSavingImage(_ image: UIImage, didFinishSavingWithError error: NSError!, contextInfo: UnsafeMutableRawPointer) {
-    //
-    //        // 結果によって出すアラートを変更する
-    //        var title = "保存完了"
-    //        var message = "カメラロールに保存しました"
-    //
-    //        if error != nil {
-    //            title = "エラー"
-    //            message = "保存に失敗しました"
-    //        }
-    //
-    //        let alertController = UIAlertController(title: title, message: message, preferredStyle: .alert)
-    //        alertController.addAction(UIAlertAction(title: "OK", style: .default, handler: nil))
-    //        self.present(alertController, animated: true, completion: nil)
-    //    }
+    // カメラロールへの保存の結果
+//    @objc func didFinishSavingImage(_ image: UIImage, didFinishSavingWithError error: NSError!, contextInfo: UnsafeMutableRawPointer) {
+//
+//        // 結果によって出すアラートを変更
+//        var title = "保存完了"
+//        var message = "カメラロールに保存しました"
+//
+//        if error != nil {
+//            title = "エラー"
+//            message = "保存に失敗しました"
+//        }
+//
+//        let alertController = UIAlertController(title: title, message: message, preferredStyle: .alert)
+//        alertController.addAction(UIAlertAction(title: "OK", style: .default, handler: nil))
+//        self.present(alertController, animated: true, completion: nil)
+//    }
     
     override func viewDidLoad() {
         super.viewDidLoad()
